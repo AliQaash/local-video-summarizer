@@ -1,0 +1,23 @@
+# Transcript cache (regenerated per video, can be large)
+transcript_cache.json
+
+# Video/audio files (never commit media)
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.wav
+*.mp3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
