@@ -15,6 +15,12 @@ Given a video file, it:
 4. Synthesizes the per-chunk summaries into one coherent, timestamped
    final summary
 
+## Demo
+
+![Demo of the pipeline running](demo.gif)
+
+*The pipeline transcribing and summarizing an Urdu-language audio clip end to end, running fully offline. (Transcription is cached between runs, so this demo shows the summarization stage against a pre-cached transcript.)*
+
 ## Why this was harder than it looks
 
 This started as a simple "wire Whisper to an LLM" script. Getting it to
