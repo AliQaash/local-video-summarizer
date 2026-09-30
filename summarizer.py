@@ -1,5 +1,6 @@
 import time
 import glob
+import json
 import os
 import re
 import sys
@@ -272,12 +273,85 @@ def pick_available_model(preferred: str) -> str:
     return preferred
 
 
-def process_video():
-    video_path = find_local_video()
-    if not video_path:
-        print("❌ No video file found in this folder.")
-        return
-    print(f"🎬  {video_path}")
+class CachedSegment:
+    """Stand-in for a faster-whisper Segment, rebuilt from the JSON cache.
+
+    Downstream code only ever reads .start, .end and .text, so this is all the
+    surface a cached run needs.
+    """
+    __slots__ = ("start", "end", "text")
+
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+
+
+def transcript_cache_path(video_path):
+    return os.path.splitext(video_path)[0] + "_transcript_cache.json"
+
+
+def cache_fingerprint(video_path):
+    """Identifies the exact inputs a cached transcript was produced from.
+
+    Any change to the media file or the transcription settings invalidates the
+    cache, so a stale transcript can never be silently reused.
+    """
+    stat = os.stat(video_path)
+    return {
+        "file": os.path.basename(video_path),
+        "size": stat.st_size,
+        "mtime": int(stat.st_mtime),
+        "model": WHISPER_MODEL,
+        "language": VIDEO_LANGUAGE,
+    }
+
+
+def load_cached_transcript(video_path):
+    """Return (segments, duration) from cache, or None when unusable."""
+    path = transcript_cache_path(video_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"⚠️   Transcript cache unreadable ({e}); re-transcribing.")
+        return None
+
+    if data.get("fingerprint") != cache_fingerprint(video_path):
+        print("ℹ️   Transcript cache is stale (file or settings changed); re-transcribing.")
+        return None
+
+    segments = [CachedSegment(s["start"], s["end"], s["text"]) for s in data["segments"]]
+    return segments, data["duration"]
+
+
+def save_cached_transcript(video_path, segments, duration):
+    path = transcript_cache_path(video_path)
+    payload = {
+        "fingerprint": cache_fingerprint(video_path),
+        "duration": duration,
+        "segments": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️   Could not write transcript cache: {e}")
+
+
+def transcribe_or_load(video_path):
+    """Transcription is by far the most expensive stage, and the LLM stage that
+    follows it fails for unrelated reasons (Ollama not running, a model not
+    pulled). Caching means those failures cost seconds to retry instead of
+    re-running the whole transcription."""
+    cached = load_cached_transcript(video_path)
+    if cached:
+        segments, duration = cached
+        print(f"📂  Reusing cached transcript ({len(segments)} segments). "
+              f"Delete {os.path.basename(transcript_cache_path(video_path))} to force a fresh run.")
+        return segments, duration
 
     # CUDA when it's actually usable, CPU otherwise. Probing with a throwaway
     # tiny model is more honest than trusting torch.cuda.is_available(), since
@@ -289,7 +363,7 @@ def process_video():
         model, used_compute_type = load_whisper_model(WHISPER_MODEL, device, compute_type, WHISPER_CACHE_DIR)
     except Exception as e:
         print(f"❌  Whisper load failed even after fallback: {e}")
-        return
+        return None
     if used_compute_type != compute_type:
         print(f"    (running at {used_compute_type} instead of {compute_type})")
 
@@ -323,18 +397,36 @@ def process_video():
         segments = list(segments_gen)
     except Exception as e:
         print(f"❌  Transcription error: {e}")
-        return
+        return None
 
     print(f"✅  Done in {round(time.time()-t0, 1)}s  |  {len(segments)} segments")
 
     del model  # release faster-whisper's VRAM before Ollama needs the GPU
 
+    duration = getattr(info, "duration", None) or (segments[-1].end if segments else 0)
+    save_cached_transcript(video_path, segments, duration)
+    return segments, duration
+
+
+def process_video():
+    video_path = find_local_video()
+    if not video_path:
+        print("❌ No video file found in this folder.")
+        return
+    print(f"🎬  {video_path}")
+
+    result = transcribe_or_load(video_path)
+    if not result:
+        return
+    segments, audio_duration = result
+    if not segments:
+        print("❌  No speech segments produced.")
+        return
+
     # ---- Coverage check ----
-    # info.duration is the true audio length decoded from the file, so it is the
-    # ground truth to measure against. Anything not covered by a segment is
-    # either real silence or dropped audio; both are shown so you can verify
-    # rather than trust.
-    audio_duration = getattr(info, "duration", None) or (segments[-1].end if segments else 0)
+    # The decoded audio duration is the ground truth to measure against.
+    # Anything not covered by a segment is either real silence or dropped
+    # audio; both are shown so you can verify rather than trust.
     covered = sum(s.end - s.start for s in segments)
     coverage_pct = (covered / audio_duration * 100) if audio_duration else 0
 

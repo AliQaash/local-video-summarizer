@@ -163,6 +163,14 @@ timestamps and any gap markers) and `<name>_summary.txt`. The transcript is
 saved *before* summarization begins, so the expensive transcription survives
 even if the LLM stage fails.
 
+Transcription is also cached to `<name>_transcript_cache.json`. Since the LLM
+stage fails for reasons unrelated to transcription (Ollama not running, model
+not pulled), a retry reuses the cached transcript and costs seconds rather
+than re-running the whole thing. The cache is fingerprinted against the media
+file's size and mtime plus the model and language settings, so it invalidates
+itself whenever any of those change. Delete the file to force a fresh
+transcription.
+
 ## Example output
 
 ```
@@ -196,6 +204,6 @@ understanding of faith.
 ## What I'd improve next
 
 - Detect language switches mid-transcript (Urdu to classical Persian) instead of fixing one language per file
-- Checkpoint between passes, so a failure in pass 2 does not discard chaptering progress
+- Checkpoint between the three LLM passes, so a failure in pass 2 does not discard chaptering progress (transcription itself is already cached)
 - Evaluate whether Whisper's `task="translate"` beats asking the summarizer to read Urdu directly, since translating at the transcription stage removes the LLM's comprehension ceiling from the critical path
 - Batch mode for processing a folder of recordings unattended

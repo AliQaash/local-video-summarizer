@@ -2,6 +2,7 @@
 *_transcript.txt
 *_summary.txt
 transcript_cache.json
+*_transcript_cache.json
 run_log.txt
 
 # Video/audio files (never commit media)
