@@ -1,164 +1,463 @@
-import json
-import os
 import time
-from faster_whisper import WhisperModel
+import glob
+import os
+import re
+import sys
+import textwrap
+
 import ollama
+from faster_whisper import WhisperModel
 
-# --- Transcription settings ---
-# MX450 only has 2GB VRAM, which is why "base"/"small" were the ceiling on GPU.
-# faster-whisper's CPU + int8 path lets us run a much larger, more accurate
-# model instead — trading some speed for real accuracy on hard audio.
-WHISPER_MODEL_SIZE = "medium"   # try "large-v3" if quality still isn't enough
-WHISPER_DEVICE = "cpu"
-WHISPER_COMPUTE_TYPE = "int8"   # keeps CPU memory/time reasonable
-LANGUAGE = "ur"
+# Force UTF-8 output regardless of whether stdout is an interactive console or
+# a redirected pipe/file — Windows otherwise falls back to a legacy codepage
+# (cp1252) on redirect, which crashes on the emoji used throughout this script.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-SUMMARY_MODEL = "llama3.1:8b"   # big step up from 1b — run: ollama pull llama3.1:8b
-                                  # (will be noticeably slower per chunk on CPU — expected)
-CHUNK_SECONDS = 180
-TRANSCRIPT_CACHE_FILE = "transcript_cache.json"
+# ─────────────────────────────────────────────
+# CONFIG  ← edit these if needed
+# ─────────────────────────────────────────────
+# large-v3 via faster-whisper (CTranslate2): same weights and accuracy as plain
+# Whisper's large-v3, but quantized inference brings it to ~4.7GB at float16,
+# where plain openai-whisper's large-v3 (~10GB) will not fit a 6GB card at all.
+WHISPER_MODEL  = "large-v3"
+COMPUTE_TYPE   = "float16"    # auto-falls back to int8_float16 on OOM, and to CPU int8 with no CUDA
+# gemma2:9b, not llama3 — on UrduMMLU (a native-Urdu academic benchmark), it's
+# the strongest open model that actually fits a 6GB card, ahead of Qwen3-8B.
+# Urdu-specific fine-tuned models score WORSE on broad Urdu comprehension than
+# strong general models, so a niche "Urdu model" would be a downgrade, not a fix.
+OLLAMA_MODEL   = "gemma2:9b"
+VIDEO_LANGUAGE = "ur"         # "ur" = Urdu  |  None = auto-detect
+
+# Three-pass chaptering, so chapters land on real topic changes instead of a
+# fixed clock interval:
+#   Pass 1 — scan the transcript in large windows, ask the LLM to mark real
+#            topic-change boundaries (not every sentence).
+#   Pass 2 — for each resulting chapter, summarize using only that chapter's
+#            actual transcript text.
+#   Pass 3 — one final pass over the whole chapter list to merge adjacent
+#            near-duplicate chapters, tighten titles, and write the overview.
+BOUNDARY_WINDOW_MINUTES = 15  # window size for pass 1 (bigger = more context per boundary judgment)
+
+# Any stretch longer than this with no transcribed speech gets flagged in the
+# console and marked inline in the transcript file, so silent drops can't hide.
+GAP_REPORT_SECONDS = 3.0
+
+# Where Whisper model weights are cached. Defaults to the standard Hugging Face
+# cache location, which works on any machine straight after a clone. Set the
+# WHISPER_CACHE_DIR environment variable to keep models somewhere else:
+#   PowerShell:  $env:WHISPER_CACHE_DIR = "D:\models\whisper"
+#   bash:        export WHISPER_CACHE_DIR=/mnt/models/whisper
+WHISPER_CACHE_DIR = os.environ.get("WHISPER_CACHE_DIR") or None
+# ─────────────────────────────────────────────
 
 
-def transcribe(video_path):
-    # Reuse a cached transcript if one exists — transcription is the slow,
-    # expensive step (minutes on CPU), and re-running it every time we're
-    # just debugging the summarization step wastes real time.
-    if os.path.exists(TRANSCRIPT_CACHE_FILE):
-        print(f"📂 Found cached transcript at {TRANSCRIPT_CACHE_FILE} — reusing it instead of re-transcribing.")
-        print("   (Delete this file if you want to force a fresh transcription.)")
-        with open(TRANSCRIPT_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+def find_local_video():
+    # Audio formats included so voice notes work too. WhatsApp exports .opus on
+    # Android and .m4a on iOS; ffmpeg decodes all of these, so Whisper handles
+    # them exactly like a video's audio track.
+    patterns = ["*.mp4", "*.mkv", "*.avi", "*.mov", "*.flv",
+                "*.opus", "*.ogg", "*.m4a", "*.mp3", "*.wav", "*.aac", "*.wma"]
+    for ext in patterns:
+        hits = glob.glob(ext)
+        if hits:
+            return hits[0]
+    return None
 
-    print(f"⏳ Loading faster-whisper '{WHISPER_MODEL_SIZE}' on CPU (int8)...")
-    model = WhisperModel(
-        WHISPER_MODEL_SIZE,
-        device=WHISPER_DEVICE,
-        compute_type=WHISPER_COMPUTE_TYPE,
+
+def format_ts(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def parse_ts_to_seconds(ts: str):
+    parts = [int(p) for p in ts.strip().split(":")]
+    if len(parts) == 2:
+        m, s = parts
+        return m * 60 + s
+    if len(parts) == 3:
+        h, m, s = parts
+        return h * 3600 + m * 60 + s
+    return None
+
+
+def detect_device():
+    """Return (device, compute_type) for whatever this machine can actually run.
+
+    Loads the tiny model as a throwaway probe. faster-whisper runs on
+    CTranslate2 rather than torch, so a torch.cuda.is_available() check can
+    report True and still fail here when cuDNN/cuBLAS is missing. Actually
+    constructing a model is the only honest test, and tiny costs ~75MB once.
+    """
+    try:
+        probe = WhisperModel("tiny", device="cuda", compute_type=COMPUTE_TYPE,
+                             download_root=WHISPER_CACHE_DIR)
+        del probe
+        return "cuda", COMPUTE_TYPE
+    except Exception:
+        print("ℹ️   No usable CUDA device. Falling back to CPU with int8.")
+        print("    Expect this to be several times slower; large-v3 on CPU is slow but accurate.")
+        return "cpu", "int8"
+
+
+def load_whisper_model(model_size, device, compute_type, download_root):
+    """Load faster-whisper, auto-downgrading precision once on VRAM failure
+    instead of crashing the whole run."""
+    try:
+        model = WhisperModel(model_size, device=device, compute_type=compute_type, download_root=download_root)
+        return model, compute_type
+    except Exception as e:
+        if device == "cuda" and compute_type != "int8_float16":
+            print(f"⚠️  Load failed with compute_type={compute_type} ({e})")
+            print("    Retrying with int8_float16 (lower VRAM footprint)...")
+            model = WhisperModel(model_size, device=device, compute_type="int8_float16", download_root=download_root)
+            return model, "int8_float16"
+        raise
+
+
+def snap_to_nearest_segment(ts_seconds, segments):
+    """LLMs sometimes slightly mangle a copied timestamp. Snap whatever it
+    returns to the nearest real segment start so chapter slicing stays exact."""
+    return min(segments, key=lambda s: abs(s.start - ts_seconds)).start
+
+
+def ollama_chat_with_retry(model, prompt, retries=2, delay_seconds=3):
+    """One retry on transient failures (e.g. a CUDA shared-object crash in
+    Ollama's llama-server right after a GPU handoff) instead of silently
+    losing that chunk's content, as happened on the previous run."""
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = ollama.chat(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.1},
+            )
+            return response["message"]["content"]
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                print(f"      ⚠️  Ollama call failed ({e}); retrying in {delay_seconds}s ({attempt+1}/{retries})…")
+                time.sleep(delay_seconds)
+    raise last_error
+
+
+def detect_chapter_boundaries(window_text, model, prior_title):
+    """Pass 1: ask the LLM to mark genuine topic changes within one window,
+    not every sentence."""
+    continuity_note = (
+        f'This window may continue the previous topic, "{prior_title}". '
+        "Don't mark a boundary right at the start unless the topic has actually changed."
+        if prior_title else
+        "This is the start of the video."
     )
+    prompt = textwrap.dedent(f"""
+        You are finding TOPIC boundaries in a video transcript — points where the
+        speaker moves to a genuinely different subject. Not every sentence, only
+        real topic shifts. Aim for natural chapter lengths (roughly 1-4 minutes),
+        not one boundary per sentence.
 
-    print(f"🎧 Transcribing audio from: {video_path} (this will be slower than 'base' — that's expected)")
-    start_time = time.time()
+        {continuity_note}
 
-    segments_iter, info = model.transcribe(
-        video_path,
-        language=LANGUAGE,        # tells Whisper the source audio is Urdu
-        task="translate",         # KEY CHANGE: output English text, not Urdu
-        condition_on_previous_text=False,
+        RULES:
+        1. Use ONLY timestamps that appear verbatim in the transcript below.
+        2. One boundary per line: [MM:SS] Short Topic Title
+        3. No other text, no numbering, no headers.
+
+        TRANSCRIPT WINDOW:
+        {window_text}
+
+        BOUNDARIES:
+    """).strip()
+
+    text = ollama_chat_with_retry(model, prompt)
+
+    boundaries = []
+    for line in text.splitlines():
+        match = re.match(r"\s*\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.+)", line)
+        if match:
+            secs = parse_ts_to_seconds(match.group(1))
+            if secs is not None:
+                boundaries.append((secs, match.group(2).strip()))
+    return boundaries
+
+
+def summarize_chapter(chapter_text, title_hint, model):
+    """Pass 2: polished title + one-sentence description from the chapter's
+    actual transcript content (not just the provisional title from pass 1)."""
+    prompt = textwrap.dedent(f"""
+        Summarize this section of a video transcript as one chapter.
+        Provisional working title (you may keep, improve, or replace it): "{title_hint}"
+
+        Respond in EXACTLY this format, nothing else:
+        TITLE: <short chapter title, a few words>
+        DESCRIPTION: <one sentence describing what's covered>
+
+        Respond in English regardless of the transcript's language. Do not translate
+        the transcript itself — just describe the topic.
+
+        TRANSCRIPT:
+        {chapter_text}
+    """).strip()
+
+    text = ollama_chat_with_retry(model, prompt)
+
+    title_match = re.search(r"TITLE:\s*(.+)", text)
+    desc_match = re.search(r"DESCRIPTION:\s*(.+)", text)
+    title = title_match.group(1).strip() if title_match else title_hint
+    desc = desc_match.group(1).strip() if desc_match else text.strip()
+    return title, desc
+
+
+def consolidate_and_overview(chapters, model):
+    """Pass 3: merge adjacent near-duplicate chapters, tighten titles, and
+    write a short overview paragraph — one combined call over the whole list."""
+    chapter_block = "\n".join(
+        f"[{format_ts(c['start'])}] {c['title']} — {c['desc']}" for c in chapters
     )
+    prompt = textwrap.dedent(f"""
+        Below is a draft chapter list for a video, generated section by section
+        (so adjacent chapters may sometimes be the same topic split in two).
 
-    segments = []
-    for seg in segments_iter:
-        segments.append({"start": seg.start, "text": seg.text})
+        TASKS:
+        1. Merge any adjacent chapters that are really the same topic — keep the
+           earlier timestamp, write one clean title and description.
+        2. Tighten titles so they're consistent and concise.
+        3. Write a 2-4 sentence OVERVIEW of the whole video.
 
-    print(f"✅ Transcription complete in {round(time.time() - start_time, 2)} seconds.")
-    print(f"   Detected/forced language: {info.language} (probability {round(info.language_probability, 2)})")
+        Respond in EXACTLY this format:
+        OVERVIEW:
+        <paragraph>
 
-    with open(TRANSCRIPT_CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(segments, f, ensure_ascii=False, indent=2)
-    print(f"💾 Cached transcript to {TRANSCRIPT_CACHE_FILE} for reuse.")
+        CHAPTERS:
+        [MM:SS] Title — Description
+        [MM:SS] Title — Description
+        ...
 
-    return segments
+        DRAFT CHAPTERS:
+        {chapter_block}
+    """).strip()
 
+    text = ollama_chat_with_retry(model, prompt)
 
-def group_into_chunks(segments, chunk_seconds=CHUNK_SECONDS):
-    chunks = []
-    current = {"start": segments[0]["start"], "text": ""}
+    if "CHAPTERS:" in text:
+        overview_part, chapters_part = text.split("CHAPTERS:", 1)
+        overview = overview_part.replace("OVERVIEW:", "").strip()
+        chapters_text = chapters_part.strip()
+    else:
+        # Model didn't follow the format — fall back to the draft list untouched.
+        overview = ""
+        chapters_text = chapter_block
 
-    for seg in segments:
-        if seg["start"] - current["start"] > chunk_seconds and current["text"]:
-            chunks.append(current)
-            current = {"start": seg["start"], "text": ""}
-        current["text"] += seg["text"]
-
-    if current["text"]:
-        chunks.append(current)
-
-    return chunks
-
-
-def summarize_chunk(chunk_text, start_label):
-    prompt = f"""Summarize ONLY what is explicitly said in this transcript segment.
-Do not add, infer, or guess any information that is not directly stated.
-Do not add parenthetical clarifications, identifications, or interpretations
-of names or terms that are not explicitly explained in the text itself
-(e.g. do not guess who a name or title refers to).
-Do not include any meta-commentary about your own response, accuracy, or
-process — output ONLY the summary text itself.
-If the segment is unclear, garbled, or too short to summarize meaningfully,
-say so explicitly instead of inventing content.
-
-Transcript segment (starting at {start_label}):
-{chunk_text}
-
-Summary (2-4 sentences max):"""
-
-    response = ollama.chat(model=SUMMARY_MODEL, messages=[
-        {"role": "user", "content": prompt}
-    ])
-    return response["message"]["content"].strip()
+    return overview, chapters_text
 
 
-def synthesize_final_summary(partial_summaries, video_title=""):
-    combined = "\n".join(partial_summaries)
-    prompt = f"""You are given a set of timestamped partial summaries from
-different segments of the same video, generated independently. Combine them
-into ONE coherent, well-structured summary of the video as a whole.
-
-Rules:
-- Use ONLY information present in the partial summaries below — do not add
-  outside knowledge, even if you recognize the topic or speaker.
-- Organize it as a short intro sentence followed by 3-6 bullet points
-  covering the main themes, each keeping its approximate timestamp.
-- Do not include meta-commentary about your own process — output only the
-  final summary.
-
-Partial summaries:
-{combined}
-
-Final structured summary:"""
-
-    response = ollama.chat(model=SUMMARY_MODEL, messages=[
-        {"role": "user", "content": prompt}
-    ])
-    return response["message"]["content"].strip()
+def pick_available_model(preferred: str) -> str:
+    try:
+        available = [m["name"] for m in ollama.list()["models"]]
+        if any(preferred in m for m in available):
+            return preferred
+        for fallback in ["gemma2:9b", "llama3.1:8b", "llama3:latest", "llama3.2:3b", "mistral", "llama3.2:1b"]:
+            if any(fallback in m for m in available):
+                print(f"⚠️  '{preferred}' not found — using '{fallback}' instead.")
+                return fallback
+        if available:
+            chosen = available[0]
+            print(f"⚠️  Using first available model: {chosen}")
+            return chosen
+    except Exception:
+        pass
+    return preferred
 
 
-def process_video(video_path):
-    segments = transcribe(video_path)
+def process_video():
+    video_path = find_local_video()
+    if not video_path:
+        print("❌ No video file found in this folder.")
+        return
+    print(f"🎬  {video_path}")
 
-    # Print the raw transcript first — check THIS looks coherent before
-    # trusting the summary. If this is still garbled, the fix is a bigger
-    # model or better audio, not the summarization step.
-    print("\n📝 ENGLISH TRANSLATION (sanity check before summarizing):\n")
-    full_text = " ".join(seg["text"] for seg in segments)
-    print(full_text[:1000] + ("..." if len(full_text) > 1000 else ""))
-    print()
+    # CUDA when it's actually usable, CPU otherwise. Probing with a throwaway
+    # tiny model is more honest than trusting torch.cuda.is_available(), since
+    # faster-whisper runs on CTranslate2, not torch: CUDA can look present to
+    # torch and still fail here on a missing cuDNN/cuBLAS.
+    device, compute_type = detect_device()
+    print(f"⏳  Loading faster-whisper ({WHISPER_MODEL}, {compute_type}) on {device.upper()} …")
+    try:
+        model, used_compute_type = load_whisper_model(WHISPER_MODEL, device, compute_type, WHISPER_CACHE_DIR)
+    except Exception as e:
+        print(f"❌  Whisper load failed even after fallback: {e}")
+        return
+    if used_compute_type != compute_type:
+        print(f"    (running at {used_compute_type} instead of {compute_type})")
 
-    print("✂️  Splitting transcript into chunks before summarization...")
-    chunks = group_into_chunks(segments)
+    print("🎧  Transcribing …")
+    t0 = time.time()
+    try:
+        segments_gen, info = model.transcribe(
+            video_path,
+            language=VIDEO_LANGUAGE,
+            beam_size=5,
+            # VAD OFF. Silero VAD misclassifies reverberant, quiet, or
+            # music-backed speech as non-speech, and anything it marks is never
+            # transcribed at all. Off means Whisper walks the entire audio in
+            # 30s windows, so no region can be skipped before it is even seen.
+            vad_filter=False,
+            # None (not just a loose number) fully DISABLES both segment-drop
+            # mechanisms. Whisper normally discards a segment when it looks like
+            # non-speech or when model confidence is low; on Urdu religious
+            # speech, confidence is legitimately low and real content gets
+            # thrown away. With both set to None the checks never run, so every
+            # decoded segment is kept.
+            no_speech_threshold=None,
+            log_prob_threshold=None,
+            # Each window stands alone, so one bad patch cannot derail the rest
+            # through a repetition loop.
+            condition_on_previous_text=False,
+            # Word-level timing. Tightens segment boundaries and lets the
+            # coverage check below detect real gaps precisely.
+            word_timestamps=True,
+        )
+        segments = list(segments_gen)
+    except Exception as e:
+        print(f"❌  Transcription error: {e}")
+        return
 
-    print(f"🤖 Summarizing {len(chunks)} chunk(s) with {SUMMARY_MODEL}...")
-    partial_summaries = []
-    for chunk in chunks:
-        start_label = time.strftime("%M:%S", time.gmtime(chunk["start"]))
-        summary = summarize_chunk(chunk["text"], start_label)
-        partial_summaries.append(f"[{start_label}] {summary}")
+    print(f"✅  Done in {round(time.time()-t0, 1)}s  |  {len(segments)} segments")
 
-    print("\n" + "=" * 50)
-    print("📊 PER-SEGMENT SUMMARIES (raw, before synthesis)")
-    print("=" * 50 + "\n")
-    for line in partial_summaries:
-        print(line + "\n")
+    del model  # release faster-whisper's VRAM before Ollama needs the GPU
 
-    print("🧵 Synthesizing one coherent final summary from the segments above...")
-    final_summary = synthesize_final_summary(partial_summaries)
+    # ---- Coverage check ----
+    # info.duration is the true audio length decoded from the file, so it is the
+    # ground truth to measure against. Anything not covered by a segment is
+    # either real silence or dropped audio; both are shown so you can verify
+    # rather than trust.
+    audio_duration = getattr(info, "duration", None) or (segments[-1].end if segments else 0)
+    covered = sum(s.end - s.start for s in segments)
+    coverage_pct = (covered / audio_duration * 100) if audio_duration else 0
 
-    print("\n" + "=" * 50)
-    print("📊 FINAL VIDEO SUMMARY")
-    print("=" * 50 + "\n")
-    print(final_summary)
+    gaps = []
+    cursor = 0.0
+    for s in segments:
+        if s.start - cursor > GAP_REPORT_SECONDS:
+            gaps.append((cursor, s.start))
+        cursor = max(cursor, s.end)
+    if audio_duration - cursor > GAP_REPORT_SECONDS:
+        gaps.append((cursor, audio_duration))
+
+    print(f"📊  Coverage: {coverage_pct:.1f}% of {format_ts(audio_duration)} "
+          f"({format_ts(covered)} transcribed)")
+    if gaps:
+        print(f"    {len(gaps)} gap(s) over {GAP_REPORT_SECONDS}s — listen to these to confirm they're silence:")
+        for g_start, g_end in gaps:
+            print(f"      {format_ts(g_start)} → {format_ts(g_end)}  ({round(g_end - g_start, 1)}s)")
+    else:
+        print(f"    No gaps over {GAP_REPORT_SECONDS}s. Transcript is continuous.")
+
+    # Gap markers go into the transcript file too, so nothing is invisible.
+    raw_lines = []
+    cursor = 0.0
+    for s in segments:
+        if s.start - cursor > GAP_REPORT_SECONDS:
+            raw_lines.append(f"[{format_ts(cursor)}] <<< NO SPEECH DETECTED for {round(s.start - cursor, 1)}s >>>")
+        raw_lines.append(f"[{format_ts(s.start)}] {s.text.strip()}")
+        cursor = max(cursor, s.end)
+    if audio_duration - cursor > GAP_REPORT_SECONDS:
+        raw_lines.append(f"[{format_ts(cursor)}] <<< NO SPEECH DETECTED for {round(audio_duration - cursor, 1)}s (to end) >>>")
+
+    raw_text = "\n".join(raw_lines)
+    transcript_path = os.path.splitext(video_path)[0] + "_transcript.txt"
+    with open(transcript_path, "w", encoding="utf-8") as f:
+        f.write(raw_text)
+    print(f"📄  Raw transcript → {transcript_path}")
+
+    llm = pick_available_model(OLLAMA_MODEL)
+
+    # ---- Pass 1: boundary detection over large windows ----
+    print(f"🔎  Pass 1/3 — detecting chapter boundaries with {llm} …")
+    all_boundaries = []
+    prior_title = None
+    window_start = 0.0
+    window = []
+    windows = []
+    for s in segments:
+        if s.start - window_start >= BOUNDARY_WINDOW_MINUTES * 60 and window:
+            windows.append(window)
+            window = []
+            window_start = s.start
+        window.append(s)
+    if window:
+        windows.append(window)
+
+    for wi, win in enumerate(windows):
+        win_text = "\n".join(f"[{format_ts(s.start)}] {s.text.strip()}" for s in win)
+        print(f"   window {wi+1}/{len(windows)}")
+        try:
+            boundaries = detect_chapter_boundaries(win_text, llm, prior_title)
+        except Exception as e:
+            print(f"   ⚠️  window {wi+1} boundary detection failed: {e}")
+            boundaries = []
+        if boundaries:
+            all_boundaries.extend(boundaries)
+            prior_title = boundaries[-1][1]
+
+    if not all_boundaries or all_boundaries[0][0] > 5:
+        all_boundaries.insert(0, (0.0, "Introduction"))
+
+    all_boundaries.sort(key=lambda b: b[0])
+    deduped = []
+    for secs, title in all_boundaries:
+        snapped = snap_to_nearest_segment(secs, segments)
+        if deduped and snapped - deduped[-1][0] < 15:
+            continue  # too close to the previous boundary — treat as noise
+        deduped.append((snapped, title))
+
+    # ---- Pass 2: summarize each chapter from its actual transcript text ----
+    print(f"✍️   Pass 2/3 — summarizing {len(deduped)} chapters …")
+    chapters = []
+    for i, (start, title_hint) in enumerate(deduped):
+        end = deduped[i + 1][0] if i + 1 < len(deduped) else segments[-1].end
+        chapter_segments = [s for s in segments if start <= s.start < end]
+        chapter_text = "\n".join(f"[{format_ts(s.start)}] {s.text.strip()}" for s in chapter_segments)
+        if not chapter_text.strip():
+            continue
+        try:
+            title, desc = summarize_chapter(chapter_text, title_hint, llm)
+        except Exception as e:
+            print(f"   ⚠️  chapter {i+1} summarization failed: {e}")
+            title, desc = title_hint, "[summary failed]"
+        chapters.append({"start": start, "title": title, "desc": desc})
+        print(f"   chapter {i+1}/{len(deduped)}: [{format_ts(start)}] {title}")
+
+    # ---- Pass 3: consolidate + overview ----
+    print("🧩  Pass 3/3 — consolidating chapters and writing overview …")
+    try:
+        overview, chapters_text = consolidate_and_overview(chapters, llm)
+    except Exception as e:
+        print(f"⚠️  Consolidation failed: {e}")
+        overview = ""
+        chapters_text = "\n".join(f"[{format_ts(c['start'])}] {c['title']} — {c['desc']}" for c in chapters)
+
+    video_title = os.path.splitext(os.path.basename(video_path))[0]
+    total_duration = format_ts(segments[-1].end) if segments else "?"
+
+    parts = [f"📹  {video_title}", f"⏱   Duration: {total_duration}", "─" * 60]
+    if overview:
+        parts += ["📝  OVERVIEW", overview, "─" * 60]
+    parts += ["📌  KEY TOPICS & TIMESTAMPS", "─" * 60, chapters_text]
+    full_summary = "\n\n".join(parts)
+
+    print("\n" + "═" * 60)
+    print(full_summary)
+    print("═" * 60)
+
+    summary_path = os.path.splitext(video_path)[0] + "_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(full_summary)
+    print(f"\n💾  Summary saved → {summary_path}")
 
 
 if __name__ == "__main__":
-    local_video_file = "my_video.mp4"
-    process_video(local_video_file)
+    process_video()
